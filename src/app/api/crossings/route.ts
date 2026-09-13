@@ -32,7 +32,26 @@ const createCrossingSchema = z.object({
   prevLng: z.number().min(-180).max(180),
   lat: z.number().min(-90).max(90),
   lng: z.number().min(-180).max(180),
+  /** When the device detected the crossing. Saves can be queued behind a slow
+   *  network, so the arrival time here is not the time of the crossing. */
+  crossedAt: z.string().datetime().optional(),
 });
+
+/** Crossing times come from the device, so only trust them inside a sane
+ *  window: no future stamps, and nothing older than a stage-length ago. */
+const MAX_BACKDATE_MS = 6 * 60 * 60 * 1000;
+const MAX_CLOCK_SKEW_MS = 5000;
+
+function resolveCrossedAt(supplied: string | undefined): Date | undefined {
+  if (!supplied) return undefined;
+  const at = new Date(supplied);
+  if (Number.isNaN(at.getTime())) return undefined;
+
+  const now = Date.now();
+  if (at.getTime() > now + MAX_CLOCK_SKEW_MS) return undefined;
+  if (at.getTime() < now - MAX_BACKDATE_MS) return undefined;
+  return at;
+}
 
 export async function POST(request: Request) {
   const session = await auth();
@@ -47,6 +66,7 @@ export async function POST(request: Request) {
   }
 
   const { routeId, controlPointId, prevLat, prevLng, lat, lng } = parsed.data;
+  const crossedAt = resolveCrossedAt(parsed.data.crossedAt);
 
   const controlPoint = await prisma.controlPoint.findUnique({
     where: { id: controlPointId },
@@ -88,29 +108,42 @@ export async function POST(request: Request) {
     return NextResponse.json(existing);
   }
 
-  // Start must be crossed before any other gate. Middle gates have no order.
-  if (!controlPoint.isStart) {
-    const startGate = await prisma.controlPoint.findFirst({
-      where: { routeId, isStart: true },
-      select: { id: true },
-    });
-    if (startGate) {
-      const startCrossing = await prisma.crossing.findUnique({
+  // The start gate opens the stage and the finish gate closes it. Skipping
+  // checkpoints is allowed — crossing the finish early just ends the run —
+  // but nothing can be recorded once the finish is behind you.
+  const bookendGates = await prisma.controlPoint.findMany({
+    where: { routeId, OR: [{ isStart: true }, { isFinish: true }] },
+    select: { id: true, isStart: true, isFinish: true },
+  });
+  const startGate = bookendGates.find((g) => g.isStart);
+  const finishGate = bookendGates.find((g) => g.isFinish);
+
+  const bookendCrossings = bookendGates.length
+    ? await prisma.crossing.findMany({
         where: {
-          userId_routeId_controlPointId: {
-            userId: session.user.id,
-            routeId,
-            controlPointId: startGate.id,
-          },
+          userId: session.user.id,
+          routeId,
+          controlPointId: { in: bookendGates.map((g) => g.id) },
         },
-      });
-      if (!startCrossing) {
-        return NextResponse.json(
-          { error: "Must cross start gate first" },
-          { status: 422 },
-        );
-      }
-    }
+        select: { controlPointId: true },
+      })
+    : [];
+  const alreadyCrossed = new Set(
+    bookendCrossings.map((c) => c.controlPointId),
+  );
+
+  if (startGate && !controlPoint.isStart && !alreadyCrossed.has(startGate.id)) {
+    return NextResponse.json(
+      { error: "Must cross start gate first" },
+      { status: 422 },
+    );
+  }
+
+  if (finishGate && alreadyCrossed.has(finishGate.id)) {
+    return NextResponse.json(
+      { error: "Stage already finished — gates are closed" },
+      { status: 422 },
+    );
   }
 
   const crossing = await prisma.crossing.create({
@@ -118,6 +151,7 @@ export async function POST(request: Request) {
       userId: session.user.id,
       routeId,
       controlPointId,
+      ...(crossedAt ? { crossedAt } : {}),
     },
     include: { controlPoint: true },
   });

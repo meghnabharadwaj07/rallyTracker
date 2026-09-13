@@ -91,9 +91,23 @@ export function TrackingView({
 
   const watchIdRef = useRef<number | null>(null);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
-  const postingRef = useRef(false);
   const crossingsRef = useRef(crossings);
-  const lastPositionRef = useRef<{ lat: number; lng: number } | null>(null);
+  const lastPositionRef = useRef<{
+    lat: number;
+    lng: number;
+    time: number;
+  } | null>(null);
+  /** Detected crossings waiting to be saved. Drained serially in the
+   *  background so detection never has to wait on the network. */
+  const queueRef = useRef<
+    Array<{
+      controlPointId: string;
+      prev: { lat: number; lng: number };
+      curr: { lat: number; lng: number };
+      crossedAt: string;
+    }>
+  >([]);
+  const drainingRef = useRef(false);
   const onPositionRef = useRef<(position: GeolocationPosition) => void>(
     () => {},
   );
@@ -117,6 +131,7 @@ export function TrackingView({
       controlPointId: string,
       prev: { lat: number; lng: number },
       curr: { lat: number; lng: number },
+      crossedAt: string,
     ): Promise<string | null> => {
       try {
         const res = await fetch("/api/crossings", {
@@ -129,6 +144,7 @@ export function TrackingView({
             prevLng: prev.lng,
             lat: curr.lat,
             lng: curr.lng,
+            crossedAt,
           }),
         });
         if (!res.ok) return null;
@@ -136,15 +152,65 @@ export function TrackingView({
         setCrossings((prevMap) =>
           new Map(prevMap).set(controlPointId, data.crossedAt),
         );
-        const point = pointsById.get(controlPointId);
-        notifyCrossing(point?.name ?? "Control point", data.crossedAt);
         return data.crossedAt as string;
       } catch {
         return null;
       }
     },
-    [routeId, pointsById],
+    [routeId],
   );
+
+  /** Roll back a queued crossing and everything queued behind it, so a failed
+   *  save can't leave later gates recorded out of order. */
+  const rollbackFrom = useCallback((controlPointId: string) => {
+    const doomed = new Set<string>([controlPointId]);
+    for (const item of queueRef.current) doomed.add(item.controlPointId);
+    queueRef.current = [];
+
+    const rolled = new Map(crossingsRef.current);
+    for (const id of doomed) rolled.delete(id);
+    crossingsRef.current = rolled;
+    setCrossings(new Map(rolled));
+  }, []);
+
+  /** Drains queued crossings serially. Saving order is preserved so the
+   *  server's "start first" rule still holds. Never blocks detection. */
+  const drainQueue = useCallback(async () => {
+    if (drainingRef.current) return;
+    drainingRef.current = true;
+    try {
+      while (queueRef.current.length > 0) {
+        const item = queueRef.current[0];
+
+        let saved: string | null = null;
+        for (let attempt = 0; attempt < 3 && saved === null; attempt++) {
+          if (attempt > 0) {
+            await new Promise((r) => setTimeout(r, 500 * attempt));
+          }
+          saved = await recordCrossing(
+            item.controlPointId,
+            item.prev,
+            item.curr,
+            item.crossedAt,
+          );
+        }
+
+        if (saved === null) {
+          const name =
+            pointsById.get(item.controlPointId)?.name ?? "a control point";
+          setStatusMessage(
+            `Couldn't save the crossing for ${name}. Check your connection — that gate was not recorded.`,
+          );
+          rollbackFrom(item.controlPointId);
+          break;
+        }
+
+        queueRef.current.shift();
+      }
+    } finally {
+      drainingRef.current = false;
+    }
+  }, [recordCrossing, pointsById, rollbackFrom]);
 
   const onPosition = useCallback(
     (position: GeolocationPosition) => {
@@ -152,20 +218,28 @@ export function TrackingView({
         lat: position.coords.latitude,
         lng: position.coords.longitude,
       };
+      const currTime = position.timestamp || Date.now();
       const prev = lastPositionRef.current;
-      lastPositionRef.current = curr;
+      lastPositionRef.current = { ...curr, time: currTime };
 
       const startCrossed = startPoint
         ? crossingsRef.current.has(startPoint.id)
         : true;
+      const finished = finishPoint
+        ? crossingsRef.current.has(finishPoint.id)
+        : false;
 
+      // Crossing the finish ends the stage — every gate closes, so a
+      // checkpoint driven over afterwards no longer counts.
       // Before start: only start is eligible.
       // After start: any uncrossed middle gate, plus finish.
-      const eligible = sortedPoints.filter((cp) => {
-        if (crossingsRef.current.has(cp.id)) return false;
-        if (!startCrossed) return cp.isStart || cp.id === startPoint?.id;
-        return true;
-      });
+      const eligible = finished
+        ? []
+        : sortedPoints.filter((cp) => {
+            if (crossingsRef.current.has(cp.id)) return false;
+            if (!startCrossed) return cp.isStart || cp.id === startPoint?.id;
+            return true;
+          });
 
       let closest: { name: string; distance: number } | null = null;
       for (const cp of eligible) {
@@ -181,7 +255,7 @@ export function TrackingView({
       }
       setNearest(closest);
 
-      if (!prev || eligible.length === 0 || postingRef.current) return;
+      if (!prev || eligible.length === 0) return;
 
       const crossedAlongPath = eligible
         .map((cp) => ({
@@ -200,42 +274,37 @@ export function TrackingView({
 
       if (crossedAlongPath.length === 0) return;
 
-      const toRecord = crossedAlongPath.map((row) => row.cp);
+      // If this one segment also cut the finish line, the stage ends there:
+      // keep the gates up to and including the finish, drop anything beyond.
+      const finishIndex = crossedAlongPath.findIndex((row) => row.cp.isFinish);
+      const accepted =
+        finishIndex === -1
+          ? crossedAlongPath
+          : crossedAlongPath.slice(0, finishIndex + 1);
 
-      postingRef.current = true;
-      for (const cp of toRecord) {
-        crossingsRef.current = new Map(crossingsRef.current).set(
-          cp.id,
-          new Date().toISOString(),
-        );
+      // Record the moment of crossing locally, then hand off to the queue.
+      // `t` is how far along prev→curr the gate was cut, so interpolating
+      // between the two fix timestamps beats using "whenever the save landed".
+      const optimistic = new Map(crossingsRef.current);
+      for (const { cp, t } of accepted) {
+        const crossedAt = new Date(
+          prev.time + t * (currTime - prev.time),
+        ).toISOString();
+        optimistic.set(cp.id, crossedAt);
+        queueRef.current.push({
+          controlPointId: cp.id,
+          prev: { lat: prev.lat, lng: prev.lng },
+          curr,
+          crossedAt,
+        });
+        notifyCrossing(cp.name, crossedAt);
       }
+      crossingsRef.current = optimistic;
+      setCrossings(new Map(optimistic));
 
-      void (async () => {
-        try {
-          for (const cp of toRecord) {
-            const crossedAt = await recordCrossing(cp.id, prev, curr);
-            if (crossedAt) {
-              crossingsRef.current = new Map(crossingsRef.current).set(
-                cp.id,
-                crossedAt,
-              );
-            } else {
-              const rolled = new Map(crossingsRef.current);
-              let clearing = false;
-              for (const later of toRecord) {
-                if (later.id === cp.id) clearing = true;
-                if (clearing) rolled.delete(later.id);
-              }
-              crossingsRef.current = rolled;
-              break;
-            }
-          }
-        } finally {
-          postingRef.current = false;
-        }
-      })();
+      void drainQueue();
     },
-    [sortedPoints, startPoint, recordCrossing],
+    [sortedPoints, startPoint, finishPoint, drainQueue],
   );
 
   useEffect(() => {
@@ -245,6 +314,7 @@ export function TrackingView({
   const startTracking = async () => {
     setStatusMessage(null);
     lastPositionRef.current = null;
+    queueRef.current = [];
 
     if (!("geolocation" in navigator)) {
       setStatusMessage("Geolocation is not supported on this device.");
