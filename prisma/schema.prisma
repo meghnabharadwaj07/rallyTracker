@@ -1,0 +1,64 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  ADMIN
+  CUSTOMER
+}
+
+model User {
+  id           String     @id @default(cuid())
+  username     String     @unique
+  passwordHash String
+  role         Role
+  createdAt    DateTime   @default(now())
+  crossings    Crossing[]
+}
+
+model Route {
+  id            String         @id @default(cuid())
+  name          String
+  createdAt     DateTime       @default(now())
+  controlPoints ControlPoint[]
+  crossings     Crossing[]
+}
+
+model ControlPoint {
+  id          String     @id @default(cuid())
+  route       Route      @relation(fields: [routeId], references: [id], onDelete: Cascade)
+  routeId     String
+  name        String
+  lat         Float
+  lng         Float
+  rangeMeters    Float
+  bearingDegrees Float      @default(0)
+  order          Int
+  isStart        Boolean    @default(false)
+  isFinish       Boolean    @default(false)
+  crossings   Crossing[]
+
+  @@index([routeId])
+}
+
+model Crossing {
+  id             String       @id @default(cuid())
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId         String
+  route          Route        @relation(fields: [routeId], references: [id], onDelete: Cascade)
+  routeId        String
+  controlPoint   ControlPoint @relation(fields: [controlPointId], references: [id], onDelete: Cascade)
+  controlPointId String
+  crossedAt      DateTime     @default(now())
+
+  @@unique([userId, routeId, controlPointId])
+  @@index([userId, routeId])
+}
