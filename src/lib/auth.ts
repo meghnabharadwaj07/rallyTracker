@@ -1,11 +1,8 @@
 import NextAuth from "next-auth";
 import Credentials from "next-auth/providers/credentials";
 import { authConfig } from "@/lib/auth.config";
-
-const HARDCODED_USERS = [
-  { id: "admin-1", username: "admin", password: "admin123", role: "ADMIN" as const },
-  { id: "customer-1", username: "customer", password: "customer123", role: "CUSTOMER" as const },
-];
+import { prisma } from "@/lib/prisma";
+import bcrypt from "bcryptjs";
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
   ...authConfig,
@@ -22,10 +19,10 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
           return null;
         }
 
-        const user = HARDCODED_USERS.find(
-          (u) => u.username === username && u.password === password,
-        );
-        if (!user) return null;
+        const user = await prisma.user.findUnique({ where: { username } });
+        if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
+          return null;
+        }
 
         return { id: user.id, name: user.username, role: user.role };
       },
